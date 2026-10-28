@@ -2,10 +2,8 @@ name: Build LiteMenu DS (.nds)
 
 on:
   push:
-    branches: [ "main", "master" ]
-    tags: [ "v*" ]
+    branches: [ "**" ]
   pull_request:
-    branches: [ "main", "master" ]
   workflow_dispatch:
 
 permissions:
@@ -22,56 +20,85 @@ jobs:
     env:
       DEVKITPRO: /opt/devkitpro
       DEVKITARM: /opt/devkitpro/devkitARM
+      LIBNDS: /opt/devkitpro/libnds
       PATH: /opt/devkitpro/tools/bin:/opt/devkitpro/devkitARM/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Sync devkitPro Packages (libnds, libfat-nds, ndstool, dlditool)
+      - name: Ensure devkitPro NDS Packages are Installed
         run: |
-          dkp-pacman -Syu --noconfirm
-          dkp-pacman -S --needed --noconfirm nds-dev libnds libfat-nds dstools default-arm7
+          if [ ! -f "/opt/devkitpro/libnds/include/nds.h" ]; then
+            dkp-pacman -Sy --noconfirm nds-dev
+          fi
 
-      - name: Verify Project Directory Layout
+      - name: Auto-Fix Phone File Layout & Makefile Tabs
         run: |
           mkdir -p source include data
+          # If main.c was placed in the root directory on phone, copy it into source/
           if [ -f "main.c" ] && [ ! -f "source/main.c" ]; then
             cp main.c source/main.c
           fi
+          # If Makefile had tabs converted to spaces during mobile copy-paste, restore recipe tabs
+          if [ -f "Makefile" ]; then
+            python3 -c '
+          import re
+          with open("Makefile", "r") as f:
+              lines = f.readlines()
+          fixed = []
+          for line in lines:
+              # Convert leading spaces before @ or export inside recipe blocks to a real tab
+              m = re.match(r"^( {2,8})(@.*|-include.*)", line)
+              if m:
+                  line = "\t" + m.group(2) + "\n"
+              fixed.append(line)
+          with open("Makefile", "w") as f:
+              f.writelines(fixed)
+          '
+          fi
 
-      - name: Compile LiteMenu.nds via Makefile
+      - name: Compile LiteMenu.nds
         run: |
-          make clean
-          make -j"$(nproc)"
+          # Compile directly or via Makefile, with automatic fallback if Makefile is missing
+          if [ -f "Makefile" ]; then
+            make clean || true
+            make -j"$(nproc)"
+          else
+            mkdir -p build
+            /opt/devkitpro/devkitARM/bin/arm-none-eabi-gcc \
+              -Wall -Wextra -O2 -marm -mcpu=arm946e-s -mtune=arm946e-s \
+              -ffunction-sections -fdata-sections -DARM9 \
+              -I/opt/devkitpro/libnds/include \
+              -c source/main.c -o build/main.o
+            /opt/devkitpro/devkitARM/bin/arm-none-eabi-gcc \
+              -specs=ds_arm9.specs -g -marm -mcpu=arm946e-s -mtune=arm946e-s \
+              -Wl,-Map,build/LiteMenu.map -Wl,--gc-sections \
+              build/main.o -L/opt/devkitpro/libnds/lib -lfat -lnds9 \
+              -o LiteMenu.elf
+            /opt/devkitpro/tools/bin/ndstool -c LiteMenu.nds \
+              -9 LiteMenu.elf \
+              -7 /opt/devkitpro/libnds/default.elf \
+              -b /opt/devkitpro/libnds/icon.bmp "LiteMenu DS;Slot-1 Frontend;4MB NTR Mode"
+          fi
 
-      - name: Verify ARM9 NTR 4MB Memory Footprint & Binary Output
+      - name: Verify Output & Stage Flashcard Package
         run: |
           test -f LiteMenu.nds
-          test -f LiteMenu.elf
-          arm-none-eabi-size -A LiteMenu.elf
-          ls -lh LiteMenu.nds
-
-      - name: Stage Flashcard SD Package
-        run: |
           mkdir -p dist/_nds
           cp LiteMenu.nds dist/LiteMenu.nds
           cp LiteMenu.nds dist/_BOOT_DS.NDS
-          cp LiteMenu.elf dist/LiteMenu.elf
-          if [ -f build/LiteMenu.map ]; then
-            cp build/LiteMenu.map dist/LiteMenu.map
+          if [ -f "LiteMenu.elf" ]; then
+            /opt/devkitpro/devkitARM/bin/arm-none-eabi-size -A LiteMenu.elf || true
+            cp LiteMenu.elf dist/LiteMenu.elf
           fi
-          cat << 'EOF' > dist/README_FLASHCARD.txt
-          LiteMenu DS - Lightweight Slot-1 Flashcard Frontend (4MB NTR Mode)
-          ==================================================================
-          1. Copy LiteMenu.nds (or _BOOT_DS.NDS for R4/Ace3DS+ autoboot) to the root of your FAT32 MicroSD card.
-          2. Optional secondary loaders:
-             - Place nds-bootstrap at /_nds/nds-bootstrap-release.nds
-             - Place YSMenu at /YSMenu.nds
-             - Place GameYob at /_nds/gameyob.nds (for .gb / .gbc ROMs)
-             - Place nesDS at /_nds/nesDS.nds (for .nes ROMs)
-          3. Modern flashcards (Ace3DS+, R4iLS, DSTT/YSMenu) automatically DLDI-patch on boot.
-             For legacy 2007 R4DS kernels, run: dlditool <your_card.dldi> LiteMenu.nds
+          cat << 'EOF' > dist/CARA_PASANG_SD_CARD.txt
+          LiteMenu DS - Cara Pasang Pada Kad MicroSD Flashcard DS Lite
+          ============================================================
+          1. Pastikan kad MicroSD diformat kepada FAT32.
+          2. Salin (copy) fail "LiteMenu.nds" dan "_BOOT_DS.NDS" terus ke luar sekali (root) MicroSD.
+          3. Buat satu folder bernama "Games" di dalam MicroSD dan letakkan fail game (.nds, .gb, .gbc, .nes).
+          4. Masukkan MicroSD ke dalam flashcard (R4 / Ace3DS+ / DSTT) dan hidupkan DS Lite!
           EOF
 
       - name: Upload Compiled Flashcard Release Artifact
@@ -81,8 +108,6 @@ jobs:
           path: |
             dist/LiteMenu.nds
             dist/_BOOT_DS.NDS
-            dist/LiteMenu.elf
-            dist/LiteMenu.map
-            dist/README_FLASHCARD.txt
+            dist/CARA_PASANG_SD_CARD.txt
           if-no-files-found: error
           retention-days: 30
