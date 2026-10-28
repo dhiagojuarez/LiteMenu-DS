@@ -30,68 +30,58 @@ jobs:
       - name: Ensure devkitPro NDS Packages are Installed
         run: |
           if [ ! -f "/opt/devkitpro/libnds/include/nds.h" ]; then
-            dkp-pacman -Sy --noconfirm nds-dev
+            dkp-pacman -Syu --noconfirm nds-dev
           fi
 
-      - name: Auto-Fix Phone File Layout & Makefile Tabs
+      - name: Locate main.c & Compile LiteMenu.nds Directly
         run: |
-          mkdir -p source include data
-          # If main.c was placed in the root directory on phone, copy it into source/
-          if [ -f "main.c" ] && [ ! -f "source/main.c" ]; then
-            cp main.c source/main.c
-          fi
-          # If Makefile had tabs converted to spaces during mobile copy-paste, restore recipe tabs
-          if [ -f "Makefile" ]; then
-            python3 -c '
-          import re
-          with open("Makefile", "r") as f:
-              lines = f.readlines()
-          fixed = []
-          for line in lines:
-              # Convert leading spaces before @ or export inside recipe blocks to a real tab
-              m = re.match(r"^( {2,8})(@.*|-include.*)", line)
-              if m:
-                  line = "\t" + m.group(2) + "\n"
-              fixed.append(line)
-          with open("Makefile", "w") as f:
-              f.writelines(fixed)
-          '
+          set -e
+          mkdir -p source build dist
+
+          if [ ! -f "source/main.c" ]; then
+            FOUND_C=$(find . -maxdepth 3 -name "*.c" | head -n 1)
+            if [ -n "$FOUND_C" ]; then
+              cp "$FOUND_C" source/main.c
+            else
+              echo "ERROR: Fail main.c belum dimasukkan ke dalam repository!"
+              exit 1
+            fi
           fi
 
-      - name: Compile LiteMenu.nds
-        run: |
-          # Compile directly or via Makefile, with automatic fallback if Makefile is missing
-          if [ -f "Makefile" ]; then
-            make clean || true
-            make -j"$(nproc)"
-          else
-            mkdir -p build
-            /opt/devkitpro/devkitARM/bin/arm-none-eabi-gcc \
-              -Wall -Wextra -O2 -marm -mcpu=arm946e-s -mtune=arm946e-s \
-              -ffunction-sections -fdata-sections -DARM9 \
-              -I/opt/devkitpro/libnds/include \
-              -c source/main.c -o build/main.o
-            /opt/devkitpro/devkitARM/bin/arm-none-eabi-gcc \
-              -specs=ds_arm9.specs -g -marm -mcpu=arm946e-s -mtune=arm946e-s \
-              -Wl,-Map,build/LiteMenu.map -Wl,--gc-sections \
-              build/main.o -L/opt/devkitpro/libnds/lib -lfat -lnds9 \
-              -o LiteMenu.elf
+          /opt/devkitpro/devkitARM/bin/arm-none-eabi-gcc \
+            -Wall -Wextra -O2 -marm -mcpu=arm946e-s -mtune=arm946e-s \
+            -ffunction-sections -fdata-sections -DARM9 \
+            -I/opt/devkitpro/libnds/include \
+            -c source/main.c -o build/main.o
+
+          /opt/devkitpro/devkitARM/bin/arm-none-eabi-gcc \
+            -specs=ds_arm9.specs -g -marm -mcpu=arm946e-s -mtune=arm946e-s \
+            -Wl,-Map,build/LiteMenu.map -Wl,--gc-sections \
+            build/main.o -L/opt/devkitpro/libnds/lib -lfat -lnds9 \
+            -o LiteMenu.elf
+
+          ARM7_ELF=$(find /opt/devkitpro -name "default.elf" | head -n 1)
+          NDS_ICON=$(find /opt/devkitpro -name "icon.bmp" | head -n 1)
+
+          if [ -n "$ARM7_ELF" ] && [ -n "$NDS_ICON" ]; then
             /opt/devkitpro/tools/bin/ndstool -c LiteMenu.nds \
               -9 LiteMenu.elf \
-              -7 /opt/devkitpro/libnds/default.elf \
-              -b /opt/devkitpro/libnds/icon.bmp "LiteMenu DS;Slot-1 Frontend;4MB NTR Mode"
+              -7 "$ARM7_ELF" \
+              -b "$NDS_ICON" "LiteMenu DS;Slot-1 Frontend;4MB NTR Mode"
+          elif [ -n "$ARM7_ELF" ]; then
+            /opt/devkitpro/tools/bin/ndstool -c LiteMenu.nds \
+              -9 LiteMenu.elf \
+              -7 "$ARM7_ELF"
+          else
+            /opt/devkitpro/tools/bin/ndstool -c LiteMenu.nds \
+              -9 LiteMenu.elf
           fi
 
-      - name: Verify Output & Stage Flashcard Package
+      - name: Stage Flashcard SD Package
         run: |
-          test -f LiteMenu.nds
-          mkdir -p dist/_nds
           cp LiteMenu.nds dist/LiteMenu.nds
           cp LiteMenu.nds dist/_BOOT_DS.NDS
-          if [ -f "LiteMenu.elf" ]; then
-            /opt/devkitpro/devkitARM/bin/arm-none-eabi-size -A LiteMenu.elf || true
-            cp LiteMenu.elf dist/LiteMenu.elf
-          fi
+          cp LiteMenu.elf dist/LiteMenu.elf
           cat << 'EOF' > dist/CARA_PASANG_SD_CARD.txt
           LiteMenu DS - Cara Pasang Pada Kad MicroSD Flashcard DS Lite
           ============================================================
@@ -108,6 +98,7 @@ jobs:
           path: |
             dist/LiteMenu.nds
             dist/_BOOT_DS.NDS
+            dist/LiteMenu.elf
             dist/CARA_PASANG_SD_CARD.txt
           if-no-files-found: error
           retention-days: 30
