@@ -1,0 +1,88 @@
+name: Build LiteMenu DS (.nds)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-nds:
+    name: Compile ARM9 Slot-1 Frontend (devkitARM)
+    runs-on: ubuntu-latest
+
+    container:
+      image: devkitpro/devkitarm:latest
+
+    env:
+      DEVKITPRO: /opt/devkitpro
+      DEVKITARM: /opt/devkitpro/devkitARM
+      PATH: /opt/devkitpro/tools/bin:/opt/devkitpro/devkitARM/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Sync devkitPro Packages (libnds, libfat-nds, ndstool, dlditool)
+        run: |
+          dkp-pacman -Syu --noconfirm
+          dkp-pacman -S --needed --noconfirm nds-dev libnds libfat-nds dstools default-arm7
+
+      - name: Verify Project Directory Layout
+        run: |
+          mkdir -p source include data
+          if [ -f "main.c" ] && [ ! -f "source/main.c" ]; then
+            cp main.c source/main.c
+          fi
+
+      - name: Compile LiteMenu.nds via Makefile
+        run: |
+          make clean
+          make -j"$(nproc)"
+
+      - name: Verify ARM9 NTR 4MB Memory Footprint & Binary Output
+        run: |
+          test -f LiteMenu.nds
+          test -f LiteMenu.elf
+          arm-none-eabi-size -A LiteMenu.elf
+          ls -lh LiteMenu.nds
+
+      - name: Stage Flashcard SD Package
+        run: |
+          mkdir -p dist/_nds
+          cp LiteMenu.nds dist/LiteMenu.nds
+          cp LiteMenu.nds dist/_BOOT_DS.NDS
+          cp LiteMenu.elf dist/LiteMenu.elf
+          if [ -f build/LiteMenu.map ]; then
+            cp build/LiteMenu.map dist/LiteMenu.map
+          fi
+          cat << 'EOF' > dist/README_FLASHCARD.txt
+          LiteMenu DS - Lightweight Slot-1 Flashcard Frontend (4MB NTR Mode)
+          ==================================================================
+          1. Copy LiteMenu.nds (or _BOOT_DS.NDS for R4/Ace3DS+ autoboot) to the root of your FAT32 MicroSD card.
+          2. Optional secondary loaders:
+             - Place nds-bootstrap at /_nds/nds-bootstrap-release.nds
+             - Place YSMenu at /YSMenu.nds
+             - Place GameYob at /_nds/gameyob.nds (for .gb / .gbc ROMs)
+             - Place nesDS at /_nds/nesDS.nds (for .nes ROMs)
+          3. Modern flashcards (Ace3DS+, R4iLS, DSTT/YSMenu) automatically DLDI-patch on boot.
+             For legacy 2007 R4DS kernels, run: dlditool <your_card.dldi> LiteMenu.nds
+          EOF
+
+      - name: Upload Compiled Flashcard Release Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiteMenu-DS-Lite-Slot1-Package
+          path: |
+            dist/LiteMenu.nds
+            dist/_BOOT_DS.NDS
+            dist/LiteMenu.elf
+            dist/LiteMenu.map
+            dist/README_FLASHCARD.txt
+          if-no-files-found: error
+          retention-days: 30
