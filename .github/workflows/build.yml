@@ -27,24 +27,305 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Ensure devkitPro NDS Packages are Installed
+      - name: Install Required NDS Packages (libnds, libfat-nds, dstools)
         run: |
-          if [ ! -f "/opt/devkitpro/libnds/include/nds.h" ]; then
-            dkp-pacman -Syu --noconfirm nds-dev
-          fi
+          dkp-pacman -Syu --noconfirm
+          dkp-pacman -S --needed --noconfirm nds-dev libnds libfat-nds dstools default-arm7
 
-      - name: Locate main.c & Compile LiteMenu.nds Directly
+      - name: Generate & Compile LiteMenu.nds
         run: |
-          set -e
+          set -x
           mkdir -p source build dist
 
+          # Jika source/main.c belum wujud dalam repo, cipta secara automatik:
           if [ ! -f "source/main.c" ]; then
             FOUND_C=$(find . -maxdepth 3 -name "*.c" | head -n 1)
             if [ -n "$FOUND_C" ]; then
               cp "$FOUND_C" source/main.c
             else
-              echo "ERROR: Fail main.c belum dimasukkan ke dalam repository!"
-              exit 1
+              cat << 'EOF' > source/main.c
+          #include <nds.h>
+          #include <nds/arm9/dldi.h>
+          #include <fat.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <strings.h>
+          #include <dirent.h>
+          #include <sys/stat.h>
+          #include <unistd.h>
+          #include <errno.h>
+
+          #define PAGE_SIZE           14
+          #define MAX_FILENAME_LEN    128
+          #define MAX_PATH_LEN        256
+          #define MAX_DIR_DEPTH       16
+
+          #define BTN_LAUNCH_X1       16
+          #define BTN_LAUNCH_Y1       136
+          #define BTN_LAUNCH_X2       120
+          #define BTN_LAUNCH_Y2       176
+          #define BTN_BACK_X1         136
+          #define BTN_BACK_Y1         136
+          #define BTN_BACK_X2         240
+          #define BTN_BACK_Y2         176
+          #define BTN_PREV_X1         16
+          #define BTN_PREV_Y1         96
+          #define BTN_PREV_X2         120
+          #define BTN_PREV_Y2         126
+          #define BTN_NEXT_X1         136
+          #define BTN_NEXT_Y1         96
+          #define BTN_NEXT_X2         240
+          #define BTN_NEXT_Y2         126
+
+          typedef enum {
+              ENTRY_TYPE_DIR = 0,
+              ENTRY_TYPE_NDS,
+              ENTRY_TYPE_GB,
+              ENTRY_TYPE_GBC,
+              ENTRY_TYPE_NES,
+              ENTRY_TYPE_UNKNOWN
+          } EntryType;
+
+          typedef struct {
+              char      name[MAX_FILENAME_LEN];
+              uint32_t  size_bytes;
+              EntryType type;
+              char      game_title[13];
+              char      game_code[5];
+          } FileEntry;
+
+          typedef struct {
+              bool      use_ysmenu_fallback;
+              bool      show_hidden_files;
+              int       backlight_level;
+          } FrontendSettings;
+
+          typedef struct __attribute__((packed)) {
+              char     title[12];
+              char     gamecode[4];
+          } NdsShortHeader;
+
+          static FileEntry        g_page_entries[PAGE_SIZE];
+          static char             g_cwd[MAX_PATH_LEN] = "fat:/";
+          static uint16_t         g_parent_cursor_stack[MAX_DIR_DEPTH];
+          static uint8_t          g_dir_depth = 0;
+
+          static int              g_total_matching_entries = 0;
+          static int              g_current_page           = 0;
+          static int              g_entries_on_page        = 0;
+          static int              g_cursor_in_page         = 0;
+          static bool             g_show_detail_modal      = false;
+          static char             g_status_msg[64]         = "Ready.";
+
+          static FrontendSettings g_settings = { false, false, 2 };
+          static PrintConsole     g_top_console;
+          static PrintConsole     g_sub_console;
+          static int              g_bg2_main_id = -1;
+
+          static void renderFatalErrorScreen(const char *stage, const char *detail, int err_code) {
+              consoleSelect(&g_sub_console);
+              iprintf("\x1b[2J\x1b[0;0H\x1b[31;1m=== CRITICAL IO DIAGNOSTIC ===\x1b[0m\n");
+              iprintf("\nStage : %.28s\nReason: %.60s\nErrno : %d\n", stage, detail, err_code);
+              iprintf("\n1. Format SD as FAT32 (32KB)\n2. Verify Slot-1 DLDI patch\n\nPress [B] or [START]");
+          }
+
+          static void initHardwareAndVRAM(void) {
+              powerOn(POWER_ALL_2D);
+              lcdMainOnTop();
+              vramSetPrimaryBanks(VRAM_A_MAIN_BG, VRAM_B_LCD, VRAM_C_SUB_BG, VRAM_D_LCD);
+              videoSetMode(MODE_5_2D | DISPLAY_BG0_ACTIVE | DISPLAY_BG2_ACTIVE);
+              videoSetModeSub(MODE_0_2D | DISPLAY_BG0_ACTIVE);
+              consoleInit(&g_top_console, 0, BgType_Text4bpp, BgSize_T_256x256, 30, 0, true, true);
+              consoleInit(&g_sub_console, 0, BgType_Text4bpp, BgSize_T_256x256, 31, 0, false, true);
+              g_bg2_main_id = bgInit(2, BgType_Bmp16, BgSize_B16_256x256, 2, 0);
+              bgSetPriority(0, 0);
+              bgSetPriority(g_bg2_main_id, 2);
+              uint16_t *vram_bmp = bgGetGfxPtr(g_bg2_main_id);
+              if (vram_bmp) {
+                  for (int y = 0; y < 192; y++) {
+                      uint16_t c = (y < 16) ? (RGB15(2,6,15)|BIT(15)) : ((y >= 176) ? (RGB15(3,8,12)|BIT(15)) : (RGB15(1,2,4)|BIT(15)));
+                      for (int x = 0; x < 256; x++) vram_bmp[y * 256 + x] = c;
+                  }
+              }
+          }
+
+          static bool initFileSystemAndDLDI(void) {
+              if (!fatInitDefault()) {
+                  renderFatalErrorScreen("FAT32 MOUNT FAILED", "fatInitDefault() returned false.", errno);
+                  return false;
+              }
+              if (chdir("fat:/") != 0) {
+                  strncpy(g_cwd, "/", sizeof(g_cwd) - 1);
+                  chdir("/");
+              }
+              if (io_dldi_data) {
+                  snprintf(g_status_msg, sizeof(g_status_msg), "DLDI: %.26s", io_dldi_data->friendlyName);
+              }
+              return true;
+          }
+
+          static EntryType classifyFileExtension(const char *filename) {
+              const char *dot = strrchr(filename, '.');
+              if (!dot || dot == filename) return ENTRY_TYPE_UNKNOWN;
+              if (strcasecmp(dot, ".nds") == 0 || strcasecmp(dot, ".ids") == 0) return ENTRY_TYPE_NDS;
+              if (strcasecmp(dot, ".gb") == 0 || strcasecmp(dot, ".sgb") == 0) return ENTRY_TYPE_GB;
+              if (strcasecmp(dot, ".gbc") == 0) return ENTRY_TYPE_GBC;
+              if (strcasecmp(dot, ".nes") == 0 || strcasecmp(dot, ".fds") == 0) return ENTRY_TYPE_NES;
+              return ENTRY_TYPE_UNKNOWN;
+          }
+
+          static bool shouldIncludeEntry(const char *name, bool is_dir) {
+              if (!name || name[0] == '\0') return false;
+              if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return false;
+              if (!g_settings.show_hidden_files && (name[0] == '.' || strcasecmp(name, "System Volume Information") == 0)) return false;
+              return is_dir ? true : (classifyFileExtension(name) != ENTRY_TYPE_UNKNOWN);
+          }
+
+          static void inspectNdsHeader(const char *full_path, FileEntry *entry) {
+              memset(entry->game_title, 0, sizeof(entry->game_title));
+              memset(entry->game_code, 0, sizeof(entry->game_code));
+              FILE *fp = fopen(full_path, "rb");
+              if (!fp) return;
+              NdsShortHeader hdr;
+              if (fread(&hdr, 1, sizeof(hdr), fp) == sizeof(hdr)) {
+                  memcpy(entry->game_title, hdr.title, 12);
+                  for (int i = 0; i < 12; i++) if (entry->game_title[i] < 32 || entry->game_title[i] > 126) entry->game_title[i] = ' ';
+                  memcpy(entry->game_code, hdr.gamecode, 4);
+                  for (int i = 0; i < 4; i++) if (entry->game_code[i] < 32 || entry->game_code[i] > 126) entry->game_code[i] = '?';
+              }
+              fclose(fp);
+          }
+
+          static int countFilteredDirectoryEntries(const char *dir_path) {
+              DIR *pdir = opendir(dir_path);
+              if (!pdir) return -1;
+              int count = 0;
+              struct dirent *pent;
+              struct stat st;
+              char full_path[MAX_PATH_LEN];
+              while ((pent = readdir(pdir)) != NULL) {
+                  bool is_dir = false;
+                  snprintf(full_path, sizeof(full_path), "%s%s%s", dir_path, (dir_path[strlen(dir_path)-1]=='/')?"":"/", pent->d_name);
+                  if (stat(full_path, &st) == 0) is_dir = S_ISDIR(st.st_mode);
+                  if (shouldIncludeEntry(pent->d_name, is_dir)) count++;
+              }
+              closedir(pdir);
+              return count;
+          }
+
+          static void loadDirectoryPage(const char *dir_path, int page_index) {
+              memset(g_page_entries, 0, sizeof(g_page_entries));
+              g_entries_on_page = 0;
+              g_total_matching_entries = countFilteredDirectoryEntries(dir_path);
+              if (g_total_matching_entries < 0) { g_total_matching_entries = 0; return; }
+              int total_pages = (g_total_matching_entries + PAGE_SIZE - 1) / PAGE_SIZE;
+              if (total_pages <= 0) total_pages = 1;
+              if (page_index >= total_pages) page_index = total_pages - 1;
+              if (page_index < 0) page_index = 0;
+              g_current_page = page_index;
+              const int start_offset = g_current_page * PAGE_SIZE;
+              int logical_index = 0;
+              char full_path[MAX_PATH_LEN];
+              struct stat st;
+              for (int pass = 0; pass < 2 && g_entries_on_page < PAGE_SIZE; pass++) {
+                  DIR *pdir = opendir(dir_path);
+                  if (!pdir) break;
+                  struct dirent *pent;
+                  while ((pent = readdir(pdir)) != NULL && g_entries_on_page < PAGE_SIZE) {
+                      bool is_dir = false;
+                      snprintf(full_path, sizeof(full_path), "%s%s%s", dir_path, (dir_path[strlen(dir_path)-1]=='/')?"":"/", pent->d_name);
+                      bool stat_ok = (stat(full_path, &st) == 0);
+                      if (stat_ok) is_dir = S_ISDIR(st.st_mode);
+                      if ((pass == 0 && !is_dir) || (pass == 1 && is_dir)) continue;
+                      if (!shouldIncludeEntry(pent->d_name, is_dir)) continue;
+                      if (logical_index >= start_offset && g_entries_on_page < PAGE_SIZE) {
+                          FileEntry *slot = &g_page_entries[g_entries_on_page];
+                          strncpy(slot->name, pent->d_name, MAX_FILENAME_LEN - 1);
+                          if (is_dir) {
+                              slot->type = ENTRY_TYPE_DIR;
+                              strcpy(slot->game_title, "<FOLDER>");
+                              strcpy(slot->game_code, "DIR ");
+                          } else {
+                              slot->type = classifyFileExtension(pent->d_name);
+                              slot->size_bytes = stat_ok ? (uint32_t)st.st_size : 0;
+                              if (slot->type == ENTRY_TYPE_NDS) inspectNdsHeader(full_path, slot);
+                              else strcpy(slot->game_code, "EMU ");
+                          }
+                          g_entries_on_page++;
+                      }
+                      logical_index++;
+                  }
+                  closedir(pdir);
+              }
+              if (g_cursor_in_page >= g_entries_on_page) g_cursor_in_page = (g_entries_on_page > 0) ? (g_entries_on_page - 1) : 0;
+          }
+
+          static void renderScreens(void) {
+              int total_pages = (g_total_matching_entries + PAGE_SIZE - 1) / PAGE_SIZE;
+              if (total_pages <= 0) total_pages = 1;
+              consoleSelect(&g_top_console);
+              iprintf("\x1b[2J\x1b[0;0H LITEMENU DS  Page %02d/%02d (%03d)", g_current_page + 1, total_pages, g_total_matching_entries);
+              iprintf("\x1b[1;0H %.30s\x1b[2;0H--------------------------------", g_cwd);
+              for (int i = 0; i < g_entries_on_page; i++) {
+                  const FileEntry *e = &g_page_entries[i];
+                  const char *b = (e->type == ENTRY_TYPE_DIR) ? "[DIR] " : "[ROM] ";
+                  iprintf("\x1b[%d;0H%c%s%.23s", 3 + i, (i == g_cursor_in_page) ? '>' : ' ', b, e->name);
+              }
+              iprintf("\x1b[21;0H--------------------------------\x1b[22;0H[A]Boot [B]Up [X]Loader [Y]Info\x1b[23;0H%.31s", g_status_msg);
+
+              consoleSelect(&g_sub_console);
+              iprintf("\x1b[2J\x1b[0;0H=== SLOT-1 INSPECTOR & TOUCH ===");
+              if (g_entries_on_page > 0) {
+                  const FileEntry *sel = &g_page_entries[g_cursor_in_page];
+                  iprintf("\x1b[2;1HFile: %.24s\x1b[3;1HSize: %lu KB\x1b[4;1HCode: [%s] %s", sel->name, (unsigned long)(sel->size_bytes/1024), sel->game_code, sel->game_title);
+              }
+              iprintf("\x1b[7;1HLoader [X]: %s", g_settings.use_ysmenu_fallback ? "YSMenu" : "nds-bootstrap / Direct");
+              iprintf("\x1b[12;2H+------------+  +------------+\x1b[13;2H| < PREV PG  |  |  NEXT PG > |\x1b[14;2H+------------+  +------------+");
+              iprintf("\x1b[17;2H+------------+  +------------+\x1b[18;2H| LAUNCH (A) |  | PARENT (B) |\x1b[19;2H+------------+  +------------+");
+          }
+
+          int main(int argc, char **argv) {
+              (void)argc; (void)argv;
+              initHardwareAndVRAM();
+              keysSetRepeat(20, 4);
+              if (!initFileSystemAndDLDI()) {
+                  while (pmMainLoop()) { swiWaitForVBlank(); scanKeys(); if (keysDown() & KEY_START) return 0; }
+                  return 0;
+              }
+              loadDirectoryPage(g_cwd, 0);
+              renderScreens();
+              while (pmMainLoop()) {
+                  swiWaitForVBlank();
+                  scanKeys();
+                  uint32_t kd = keysDown();
+                  uint32_t kr = keysDownRepeat();
+                  if (kd || kr) {
+                      if (kd & KEY_START) break;
+                      if ((kd | kr) & KEY_UP && g_entries_on_page > 0) g_cursor_in_page = (g_cursor_in_page > 0) ? g_cursor_in_page - 1 : g_entries_on_page - 1;
+                      if ((kd | kr) & KEY_DOWN && g_entries_on_page > 0) g_cursor_in_page = (g_cursor_in_page + 1 < g_entries_on_page) ? g_cursor_in_page + 1 : 0;
+                      if ((kd | kr) & KEY_LEFT && g_current_page > 0) { loadDirectoryPage(g_cwd, g_current_page - 1); g_cursor_in_page = 0; }
+                      if ((kd | kr) & KEY_RIGHT) { loadDirectoryPage(g_cwd, g_current_page + 1); g_cursor_in_page = 0; }
+                      if (kd & KEY_X) g_settings.use_ysmenu_fallback = !g_settings.use_ysmenu_fallback;
+                      if (kd & KEY_A && g_entries_on_page > 0) {
+                          FileEntry *e = &g_page_entries[g_cursor_in_page];
+                          if (e->type == ENTRY_TYPE_DIR) {
+                              snprintf(g_cwd + strlen(g_cwd), MAX_PATH_LEN - strlen(g_cwd), "%s%s", (g_cwd[strlen(g_cwd)-1]=='/')?"":"/", e->name);
+                              loadDirectoryPage(g_cwd, 0);
+                          } else {
+                              char path[MAX_PATH_LEN];
+                              snprintf(path, sizeof(path), "%s%s%s", g_cwd, (g_cwd[strlen(g_cwd)-1]=='/')?"":"/", e->name);
+                              const char *av[2] = { path, NULL };
+                              runNdsFile(path, 1, av);
+                          }
+                      }
+                      renderScreens();
+                  }
+              }
+              return 0;
+          }
+          EOF
+              sed -i 's/^          //' source/main.c
             fi
           fi
 
